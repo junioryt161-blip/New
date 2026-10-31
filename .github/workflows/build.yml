@@ -17,12 +17,15 @@ jobs:
       - name: Download voice models
         run: |
           A=app/src/main/assets
-          rm -rf $A/model-en $A/model-spk
+          mkdir -p $A tmp-en tmp-spk
           curl -L -o en.zip https://alphacephei.com/vosk/models/vosk-model-small-en-in-0.4.zip
           curl -L -o spk.zip https://alphacephei.com/vosk/models/vosk-model-spk-0.4.zip
-          unzip -q en.zip -d tmp && mv tmp/vosk-model-small-en-in-0.4 $A/model-en
-          unzip -q spk.zip -d tmp && mv tmp/vosk-model-spk-0.4 $A/model-spk
-          uuidgen > $A/model-en/uuid; uuidgen > $A/model-spk/uuid
+          unzip -q en.zip -d tmp-en
+          unzip -q spk.zip -d tmp-spk
+          mv tmp-en/* $A/model-en
+          mv tmp-spk/* $A/model-spk
+          uuidgen > $A/model-en/uuid
+          uuidgen > $A/model-spk/uuid
       - run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with: { name: Friday-APK, path: app/build/outputs/apk/debug/app-debug.apk }
