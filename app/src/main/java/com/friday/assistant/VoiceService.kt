@@ -4,6 +4,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
+import android.view.KeyEvent
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
@@ -56,6 +58,11 @@ class VoiceService : Service() {
     @Volatile private var lastWake = 0L
     @Volatile private var crText = ""
     @Volatile private var crAt = 0L
+    @Volatile private var pausedByUs = false
+    @Volatile private var resumeAfterSpeech = false
+    @Volatile private var sayCount = 0
+    private val am by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
+    @Volatile private var pre = ""   // words Vosk already heard after the wake word, before Google starts
     private var spkModel: SpeakerModel? = null
     private var gain = 3f
     private val stopWords = setOf("stop", "stop talking", "quiet", "be quiet", "cancel", "enough", "shut up", "silence")
@@ -70,7 +77,8 @@ class VoiceService : Service() {
             tts.setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ASSISTANT).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
             tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(id: String?) { speaking = true }
-                override fun onDone(id: String?) { speaking = false; muteUntil = System.currentTimeMillis() + 300; genDirty = true }
+                override fun onDone(id: String?) { speaking = false; muteUntil = System.currentTimeMillis() + 300; genDirty = true
+                    if (resumeAfterSpeech && router.asyncBusy.get() == 0) { resumeAfterSpeech = false; resumeMedia() } }
                 override fun onError(id: String?) { speaking = false }
                 override fun onStop(id: String?, interrupted: Boolean) { speaking = false }
             })
@@ -96,11 +104,29 @@ class VoiceService : Service() {
 
     private fun runCmd(cmd: String) {
         worker.submit {
+            val before = sayCount
             try { OverlayBubble.state(2); router.handle(cmd, !onMode) }
             catch (e: Exception) { Bus.post("info", "Error: ${e.javaClass.simpleName} ${e.message}") }
             finally { if (!onMode) OverlayBubble.state(0) }
+            // We paused the music/video to hear you: give it back unless you asked for something media-related
+            if (pausedByUs) {
+                pausedByUs = false
+                if (!router.keepPaused) {
+                    Thread.sleep(500)
+                    if (speaking || sayCount > before || router.asyncBusy.get() > 0) {
+                        resumeAfterSpeech = true
+                        Handler(Looper.getMainLooper()).postDelayed({ if (resumeAfterSpeech) { resumeAfterSpeech = false; resumeMedia() } }, 25000)
+                    } else resumeMedia()
+                }
+            }
         }
     }
+
+    private fun mediaPlaying(): Boolean = try {
+        am.activePlaybackConfigurations.any { val u = it.audioAttributes.usage; u == AudioAttributes.USAGE_MEDIA || u == AudioAttributes.USAGE_GAME || u == AudioAttributes.USAGE_UNKNOWN }
+    } catch (e: Exception) { false }
+    private fun key(code: Int) { am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code)); am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code)) }
+    private fun resumeMedia() { key(KeyEvent.KEYCODE_MEDIA_PLAY) }
 
     private fun grammar(wake: String): String {
         val pm = packageManager
@@ -158,7 +184,14 @@ class VoiceService : Service() {
             val now = System.currentTimeMillis()
             if (now - lastWake < 1200) return
             lastWake = now; awakeUntil = now + 8000; OverlayBubble.state(1)
-            if (speaking) { tts.stop(); speaking = false; muteUntil = 0; gen.reset(); genDirty = false; Bus.post("info", "Interrupted") }
+            if (speaking) { tts.stop(); speaking = false; muteUntil = 0; Bus.post("info", "Interrupted") }
+            if (!pausedByUs && mediaPlaying()) { key(KeyEvent.KEYCODE_MEDIA_PAUSE); pausedByUs = true }   // so we can hear you clearly
+            if (prefs.smart && !enrolling && SpeechRecognizer.isRecognitionAvailable(this@VoiceService)) {
+                val pt = try { JSONObject(gen.partialResult).optString("partial") } catch (e: Exception) { "" }
+                val tk = pt.split(" ").filter { it.isNotEmpty() }; val we = wakeEnd(tk, wake)
+                pre = if (we >= 0) tk.drop(we).joinToString(" ") else ""
+                needSmart = true          // Google takes over immediately
+            } else if (speaking) { gen.reset(); genDirty = false }
         }
 
         while (running) {
@@ -170,9 +203,12 @@ class VoiceService : Service() {
             if (!recording) { ar.startRecording(); recording = true; OverlayBubble.visible(true); ear.reset(); gen.reset() }
             if (needSmart) {
                 needSmart = false; ar.stop()
-                val txt = smartListen()
+                val g = smartListen()
                 ar.startRecording(); ear.reset(); gen.reset()
-                if (txt != null) { Bus.post("heard", txt); runCmd(txt) } else { awakeUntil = System.currentTimeMillis() + 6000; OverlayBubble.state(0) }
+                val full = if (g != null && pre.isNotEmpty() && !router.understands(g) && router.understands("$pre $g")) "$pre $g" else g
+                val use = full ?: pre.takeIf { it.isNotEmpty() && router.understands(it) }
+                pre = ""
+                if (use != null) { Bus.post("heard", use); runCmd(use) } else { Bus.post("info", "Did not catch that – say it again"); if (pausedByUs) { pausedByUs = false; resumeMedia() }; awakeUntil = System.currentTimeMillis() + 6000; OverlayBubble.state(0) }
                 continue
             }
             val n = ar.read(buf, 0, buf.size); if (n <= 0) continue
@@ -185,6 +221,7 @@ class VoiceService : Service() {
                 val pt = JSONObject(ear.partialResult).optString("partial")
                 if (pt.isNotEmpty() && wakeEnd(pt.split(" "), wake) >= 0) onWake()
             }
+            if (needSmart) continue
             if (speaking || System.currentTimeMillis() < muteUntil) continue
             if (genDirty) { gen.reset(); genDirty = false }
             if (gen.acceptWaveForm(buf, n)) process(JSONObject(gen.result), wake)
@@ -203,7 +240,7 @@ class VoiceService : Service() {
                 sr!!.setRecognitionListener(object : RecognitionListener {
                     override fun onResults(r: Bundle?) {
                         val l = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        out = l?.firstOrNull { router.understands(it) } ?: l?.firstOrNull(); latch.countDown()
+                        if (l != null) Bus.post("ear", "Google: " + l.take(3).joinToString("  |  ")); out = l?.firstOrNull { router.understands(it) } ?: l?.firstOrNull(); latch.countDown()
                     }
                     override fun onError(e: Int) { latch.countDown() }
                     override fun onReadyForSpeech(p: Bundle?) { OverlayBubble.caption("Listening…") }
@@ -292,6 +329,9 @@ class VoiceService : Service() {
         genDirty = true
     }
 
-    fun say(t: String) { Bus.post("reply", t); genDirty = true; tts.speak(t, TextToSpeech.QUEUE_FLUSH, null, "f") }
+    fun say(t: String) {
+        Bus.post("reply", if (t.length > 160) t.take(160) + "…" else t); sayCount++; genDirty = true
+        t.chunked(3000).forEachIndexed { i, c -> tts.speak(c, if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, "f$i") }
+    }
     override fun onDestroy() { running = false; worker.shutdown(); OverlayBubble.hide(this); tts.shutdown(); super.onDestroy() }
 }

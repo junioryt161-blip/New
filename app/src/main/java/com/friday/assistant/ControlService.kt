@@ -36,6 +36,13 @@ class ControlService : AccessibilityService() {
     }
     private fun label(x: AccessibilityNodeInfo) = ((x.text ?: "").toString() + " " + (x.contentDescription ?: "")).lowercase()
     fun nodes() = all(rootInActiveWindow)
+    fun findNode(vararg words: String): AccessibilityNodeInfo? = nodes().firstOrNull { x -> val t = label(x); t.isNotBlank() && words.any { t.contains(it) } }
+    fun labelOf(n: AccessibilityNodeInfo) = label(n).trim().take(40)
+    fun tapNode(n: AccessibilityNodeInfo): Boolean {
+        var c: AccessibilityNodeInfo? = n
+        while (c != null && !c.isClickable) c = c.parent
+        return (c ?: n).performAction(AccessibilityNodeInfo.ACTION_CLICK) || tapCenter(n)
+    }
 
     fun clickText(vararg words: String): Boolean {
         val n = nodes().firstOrNull { x -> val t = label(x); t.isNotBlank() && words.any { t.contains(it.lowercase()) } } ?: return false

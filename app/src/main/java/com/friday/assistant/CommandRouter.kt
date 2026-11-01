@@ -32,6 +32,10 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
     private var lastIds = listOf<String>(); private var lastIdsAt = 0L
     private var newsTitles = listOf<String>()
     private var torchOn = false
+    @Volatile var keepPaused = false
+    val asyncBusy = java.util.concurrent.atomic.AtomicInteger(0)
+    private var newsLinks = listOf<String>(); private var newsDescs = listOf<String>()
+    private val history = ArrayList<Pair<String, String>>()
     private val ordinals = mapOf("first" to 1, "1st" to 1, "second" to 2, "2nd" to 2, "third" to 3, "3rd" to 3, "fourth" to 4, "4th" to 4, "fifth" to 5, "5th" to 5)
     private val pk = mapOf("youtube" to "com.google.android.youtube", "whatsapp" to "com.whatsapp", "chrome" to "com.android.chrome",
         "gmail" to "com.google.android.gm", "maps" to "com.google.android.apps.maps", "instagram" to "com.instagram.android",
@@ -82,8 +86,11 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
         for (p in splitChain(t)) out += (parseOne(p) ?: "unknown $p")
         // "open camera" + "take photo"  ->  just take the photo; "open youtube" + "play x" -> just play
         val r = mutableListOf<String>()
+        var skip = false
         for ((i, c) in out.withIndex()) {
+            if (skip) { skip = false; continue }
             val nx = out.getOrNull(i + 1)
+            if (nx != null && c.startsWith("camera ") && nx == "photo back") { r += "photo " + c.removePrefix("camera "); skip = true; continue }
             if (nx != null && ((c == "open camera" && nx.startsWith("photo")) || (c == "open youtube" && (nx.startsWith("play ") || nx.startsWith("yt_search "))))) continue
             r += c
         }
@@ -99,15 +106,20 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
         return out
     }
 
+    private fun isChat(t: String) = Regex("^(?:hi|hello|hello there|namaste|namaskar|good morning|good afternoon|good evening|good night|how are you|how are you doing|how do you do|what is up|who are you|what is your name|what are you|thank you|thanks|i love you|tell me a joke|joke|tell me something funny|are you there|do you hear me|can you hear me|how is your day|what can you do|help|bye|goodbye|good bye|you are awesome|you are great|you are smart|kaise ho|aap kaise ho|tum kaise ho|kya haal hai)$").matches(t)
+
     private fun parseOne(t: String): String? {
         if (t.isEmpty()) return null
         val tok = t.split(" "); val lead = tok[0]
         Regex("^(?:go )?(on|off) mode$").find(t)?.let { return "mode " + it.groupValues[1] }
         if (Regex("^(?:stop|quiet|be quiet|cancel|enough|shut up|silence)(?: talking)?$").matches(t)) return "silence"
+        if (isChat(t)) return "chat $t"
         if (lead != "play" && lead != "search" && tok.size <= 7 && (has(t, "torch") || (has(t, "light", "lights", "lamp") && has(t, "on", "off")))) {
             val off = has(t, "off", "close", "disable", "stop"); val on = has(t, "on", "enable", "start")
             return if (off) "torch off" else if (on) "torch on" else "torch toggle"
         }
+        if (lead != "play" && has(t, "camera") && has(t, "front", "selfie", "rear", "back") && !has(t, "photo", "picture", "pic", "click", "take", "snap", "capture"))
+            return if (has(t, "front", "selfie")) "camera front" else "camera back"
         if (lead != "play" && has(t, "photo", "picture", "pic", "selfie", "snap") && (has(t, "take", "click", "capture", "snap", "selfie") || t == "photo"))
             return if (has(t, "selfie", "front")) "photo front" else "photo back"
         Regex("^(?:call|dial|phone|ring)\\s+(.+)$").find(t)?.let { return "call " + it.groupValues[1].removePrefix("to ").removeSuffix(" ko").trim() }
@@ -115,7 +127,8 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
         if (t != "search" && Regex("^(?:open )?(?:the )?search(?: bar| box)?$").matches(t)) return "searchbar"
         if (t == "play music" || t == "play my music" || t == "play songs") return "music"
         Regex("^(?:play|open|select|pick|choose)\\s+(?:the\\s+)?(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)(?:\\s+\\w+)?$").find(t)?.let { return "nth " + ordinals[it.groupValues[1]] }
-        if (Regex("^(?:play|resume|pause|play video|pause video|stop video|play song|pause song)$").matches(t)) return "media toggle"
+        if (Regex("^(?:pause|pause video|stop video|pause song|pause music|stop music)$").matches(t)) return "media pause"
+        if (Regex("^(?:play|resume|play video|play song|continue|resume video)$").matches(t)) return "media play"
         Regex("^(?:search|find|look up|look for)\\s+(?:for\\s+)?(.+?)\\s+(?:on|in|at)\\s+youtube$").find(t)?.let { return "yt_search " + it.groupValues[1] }
         Regex("^youtube\\s+(?:search|par search|pe search)\\s+(.+)$").find(t)?.let { return "yt_search " + it.groupValues[1] }
         var q: String? = Regex("^(?:play|put on)\\s+(.+)$").find(t)?.groupValues?.get(1)
@@ -144,6 +157,10 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
         Regex("^(?:type|write)\\s+(.+)$").find(t)?.let { return "type " + it.groupValues[1] }
         if (Regex("^(?:what is the time|time|what time is it|tell me the time|current time|what is time)$").matches(t)) return "time"
         if (Regex("^(?:date|what is the date|todays date|what is todays date|what day is it|what is the day today)$").matches(t)) return "date"
+        if (has(t, "news") && Regex("(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th|\\b[1-6]\\b)").containsMatchIn(t) && has(t, "detail", "details", "full", "more", "read", "about", "tell")) {
+            val n = ordinals.entries.firstOrNull { has(t, it.key) }?.value ?: Regex("\\b([1-6])\\b").find(t)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+            return "newsdetail $n"
+        }
         if (has(t, "news", "headlines") && lead != "play") return "news"
         Regex("^(?:search|find|look up|look for|google)\\s+(?:for\\s+)?(.+)$").find(t)?.let { return "search " + it.groupValues[1] }
         if (Mathx.intent(t)) return "math $t"
@@ -156,6 +173,7 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
     // ---------------- main entry ----------------
     fun handle(raw: String, allowAsk: Boolean = true) {
         val cleaned = clean(raw)
+        keepPaused = false
         Regex("^(?:learn|remember)(?: that)?\\s+(.+?)\\s+(?:means|mean|is)\\s+(.+)$").find(cleaned)?.let { m ->
             val v = resolve(m.groupValues[2])
             if (v.isNotEmpty() && v.none { it.startsWith("unknown ") }) { Learned.put(clean(m.groupValues[1]), v.joinToString("||")); say("Learned. When you say ${m.groupValues[1]}, I will do ${m.groupValues[2]}") }
@@ -170,6 +188,7 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
             if (ai != null && ai.isNotEmpty()) { cmds = ai; viaAi = true } else cmds = listOf("ask $cleaned")
         } else if (!allowAsk && cmds.size == 1 && cmds[0].startsWith("ask ")) { Bus.post("info", "Ignored: $cleaned"); return }
         Bus.post("info", "→ " + cmds.joinToString(" ; "))
+        keepPaused = cmds.any { it.startsWith("media") || it.startsWith("play ") || it.startsWith("nth") || it.startsWith("music") || it.startsWith("yt_search") || it.startsWith("open ") || it.startsWith("photo") || it.startsWith("camera") }
         var ok = true
         for ((i, c) in cmds.withIndex()) { ok = exec(c) && ok; if (i < cmds.size - 1) Thread.sleep(if (c.startsWith("open ")) 2500 else 700) }
         val learnable = cmds.all { it.startsWith("torch") || it.startsWith("open ") || it.startsWith("media") || it.startsWith("scroll") || it.startsWith("volume") || it == "time" || it == "news" || it.startsWith("photo") }
@@ -188,7 +207,19 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
             "yt_search" -> { youtube(arg, false); true }
             "nth" -> playNth(arg.toIntOrNull() ?: 1)
             "music" -> { if (!launch(Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_MUSIC))) { say("No music app found"); false } else { say("Opening music"); true } }
-            "media" -> { mediaKey(when (arg) { "next" -> KeyEvent.KEYCODE_MEDIA_NEXT; "prev" -> KeyEvent.KEYCODE_MEDIA_PREVIOUS; else -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE }); true }
+            "media" -> {
+                when (arg) {
+                    "pause" -> mediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE)
+                    "play" -> mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
+                    "next" -> { mediaKey(KeyEvent.KEYCODE_MEDIA_NEXT); Thread.sleep(400); mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY) }
+                    "prev" -> { mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS); Thread.sleep(400); mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY) }
+                    else -> mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+                }
+                true
+            }
+            "camera" -> openCamera(arg == "front")
+            "chat" -> chat(arg)
+            "newsdetail" -> { newsDetail(arg.toIntOrNull() ?: 1); true }
             "scroll" -> acc()?.swipe(arg == "down") ?: false
             "swipe" -> acc()?.swipeH(arg == "left") ?: false
             "volume" -> { audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, if (arg == "up") AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI); true }
@@ -308,18 +339,29 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
         } catch (e: Exception) { say("Flashlight failed: ${e.javaClass.simpleName}"); false }
     }
 
-    // ---------------- camera: open it and press the shutter ----------------
-    private fun takePhoto(front: Boolean): Boolean {
+    // ---------------- camera: open it, pick the lens, press the shutter ----------------
+    /** Camera apps label the switch button with the lens it switches TO, so we can tell which lens is active. */
+    private fun openCamera(front: Boolean): Boolean {
         val a = acc() ?: return false
         say(if (front) "Opening front camera" else "Opening camera")
-        if (!(Foreground.pkg ?: "").contains("camera")) {
-            val i = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
-            if (front) { i.putExtra("android.intent.extras.CAMERA_FACING", 1); i.putExtra("android.intent.extras.LENS_FACING_FRONT", 1); i.putExtra("android.intent.extra.USE_FRONT_CAMERA", true) }
-            if (!launch(i)) { say("I could not open the camera"); return false }
-            Thread.sleep(2300)
+        val fresh = !(Foreground.pkg ?: "").contains("camera")
+        if (fresh) {
+            if (!launch(Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA))) { say("I could not open the camera"); return false }
+            Thread.sleep(2400)
         }
-        if (front) a.clickText("switch to front", "selfie") else a.clickText("switch to rear", "switch to back")
-        Thread.sleep(900)
+        val toFront = a.findNode("switch to front", "to front camera", "front camera", "selfie camera")
+        val toRear = a.findNode("switch to rear", "switch to back", "to rear camera", "to back camera", "rear camera", "back camera")
+        val generic = a.findNode("switch camera", "flip camera", "rotate camera", "switch cameras", "camera switch", "reverse camera", "flip", "switch")
+        Bus.post("info", "Camera buttons: " + listOfNotNull(toFront?.let { "[" + a.labelOf(it) + "]" }, toRear?.let { "[" + a.labelOf(it) + "]" }, generic?.let { "[" + a.labelOf(it) + "]" }).joinToString(" "))
+        if (front) {
+            if (toFront != null && toRear == null) a.tapNode(toFront)
+            else if (toFront == null && toRear == null && generic != null) a.tapNode(generic)
+        } else if (toRear != null && toFront == null) a.tapNode(toRear)
+        Thread.sleep(1300); return true
+    }
+    private fun takePhoto(front: Boolean): Boolean {
+        val a = acc() ?: return false
+        if (!openCamera(front)) return false
         say("Smile. 3, 2, 1"); Thread.sleep(3500)
         var ok = false
         for (k in 0 until 8) { if (a.clickText("shutter", "take photo", "take picture", "capture")) { ok = true; break }; Thread.sleep(500) }
@@ -357,15 +399,77 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
         } else ask(t)
     }
 
+    // ---------------- chat ----------------
+    private val jokes = listOf("Why did the phone go to school? To get smarter!", "Why was the computer cold? It left its Windows open.",
+        "What do you call a sleeping bull? A bulldozer.", "Why did the smartphone need glasses? It lost all its contacts.")
+    private fun chat(t: String): Boolean {
+        val n = prefs.callMe
+        val r: String = when {
+            t.contains("how are you") || t.contains("kaise ho") || t.contains("kya haal") || t.contains("how do you do") || t.contains("how is your day") -> "I am doing great, thank you for asking $n. How are you?"
+            t.contains("who are you") || t.contains("your name") || t.contains("what are you") -> "I am ${prefs.assistantName}, your voice assistant."
+            t.contains("thank") -> "You are welcome $n!"
+            t.contains("love you") -> "That is kind of you $n. I am happy to help you."
+            t.contains("joke") || t.contains("funny") -> jokes.random()
+            t.contains("what can you do") || t == "help" -> "I can open apps, play YouTube videos, control the flashlight and camera, call your contacts, do maths, read the news and chat with you."
+            t.contains("bye") -> "Goodbye $n! Call me anytime."
+            t.contains("morning") -> "Good morning $n! Have a great day."
+            t.contains("afternoon") -> "Good afternoon $n!"
+            t.contains("evening") -> "Good evening $n!"
+            t.contains("night") -> "Good night $n. Sleep well!"
+            t.contains("awesome") || t.contains("great") || t.contains("smart") -> "Thank you $n!"
+            else -> "Hello $n! I am here. How can I help?"
+        }
+        if (prefs.aiKey.isNotBlank()) { thread { asyncBusy.incrementAndGet(); try { say(aiAnswer(t) ?: r) } finally { asyncBusy.decrementAndGet() } }; return true }
+        say(r); return true
+    }
+
     // ---------------- online: news, answers, optional AI ----------------
+    private fun strip(x: String) = x.replace(Regex("<!\\[CDATA\\[|\\]\\]>"), "").replace(Regex("<[^>]+>"), " ").replace("&amp;", "and").replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ").replace(Regex("\\s+"), " ").trim()
+    private fun fetch(u: String): String {
+        val c = URL(u).openConnection() as HttpURLConnection
+        c.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+        c.connectTimeout = 9000; c.readTimeout = 10000
+        return c.inputStream.bufferedReader().readText()
+    }
     private fun news() { thread {
+        asyncBusy.incrementAndGet()
         try {
-            val xml = URL("https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en").readText()
-            newsTitles = Regex("<item>.*?<title>(.*?)</title>", RegexOption.DOT_MATCHES_ALL).findAll(xml).map { it.groupValues[1].replace("&amp;", "and").replace("&quot;", "") }.take(6).toList()
-            say("Today's headlines. " + newsTitles.mapIndexed { i, s -> "${i + 1}. $s" }.joinToString(". "))
-        } catch (e: Exception) { say("I could not fetch the news") } } }
+            val items = mutableListOf<Triple<String, String, String>>()
+            try {
+                val xml = fetch("https://timesofindia.indiatimes.com/rssfeedstopstories.cms")
+                for (m in Regex("<item>(.*?)</item>", RegexOption.DOT_MATCHES_ALL).findAll(xml).take(6)) {
+                    val b = m.groupValues[1]
+                    val ti = strip(Regex("<title>(.*?)</title>", RegexOption.DOT_MATCHES_ALL).find(b)?.groupValues?.get(1) ?: "")
+                    val de = strip(Regex("<description>(.*?)</description>", RegexOption.DOT_MATCHES_ALL).find(b)?.groupValues?.get(1) ?: "")
+                    val li = strip(Regex("<link>(.*?)</link>", RegexOption.DOT_MATCHES_ALL).find(b)?.groupValues?.get(1) ?: "")
+                    if (ti.isNotEmpty()) items += Triple(ti, de, li)
+                }
+            } catch (e: Exception) {}
+            if (items.isEmpty()) {
+                val xml = fetch("https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en")
+                for (m in Regex("<item>.*?<title>(.*?)</title>.*?<link>(.*?)</link>", RegexOption.DOT_MATCHES_ALL).findAll(xml).take(6)) items += Triple(strip(m.groupValues[1]), "", strip(m.groupValues[2]))
+            }
+            if (items.isEmpty()) return@thread say("I could not fetch the news")
+            newsLinks = items.map { it.third }; newsDescs = items.map { it.second }
+            say("Today's top news. " + items.take(5).mapIndexed { i, x -> "News ${i + 1}. ${x.first}. " + x.second.take(170) }.joinToString(" ") + " Say tell me more about news 2, or any number, for full detail.")
+        } catch (e: Exception) { say("I could not fetch the news") } finally { asyncBusy.decrementAndGet() } } }
+
+    private fun newsDetail(n: Int) { thread {
+        asyncBusy.incrementAndGet()
+        try {
+            val link = newsLinks.getOrNull(n - 1) ?: return@thread say("Ask me for today's news first")
+            say("Getting the full story")
+            var text = ""
+            try {
+                val html = fetch(link)
+                text = Regex("<p[^>]*>(.*?)</p>", RegexOption.DOT_MATCHES_ALL).findAll(html).map { strip(it.groupValues[1]) }.filter { it.length > 70 }.take(7).joinToString(" ")
+            } catch (e: Exception) {}
+            if (text.isBlank()) text = newsDescs.getOrNull(n - 1) ?: ""
+            say(if (text.isBlank()) "I could not open that story" else text.take(3500))
+        } finally { asyncBusy.decrementAndGet() } } }
 
     private fun ask(q: String) { thread {
+        asyncBusy.incrementAndGet()
         try {
             aiAnswer(q)?.let { return@thread say(it) }
             val e = enc(q.replace(Regex("^(how to|what is|who is|tell me about)\\s+"), ""))
@@ -373,14 +477,13 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
             if (ddg.isNotBlank()) return@thread say(ddg)
             val s = JSONObject(URL("https://en.wikipedia.org/api/rest_v1/page/summary/$e").readText()).optString("extract")
             say(if (s.isNotBlank()) s else "I did not find anything for that")
-        } catch (ex: Exception) { say("Sorry, I did not understand: $q") } } }
+        } catch (ex: Exception) { say("Sorry, I did not understand: $q") } finally { asyncBusy.decrementAndGet() } } }
 
     /** Optional: the user's own Claude API key. Only the command TEXT is sent – never screen content. */
-    private fun claude(system: String, user: String, max: Int): String? {
+    private fun claudeMsgs(system: String, msgs: JSONArray, max: Int): String? {
         val key = prefs.aiKey; if (key.isBlank()) return null
         return try {
-            val body = JSONObject().put("model", "claude-haiku-5-5").put("max_tokens", max).put("system", system)
-                .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", user)))
+            val body = JSONObject().put("model", "claude-haiku-5-5").put("max_tokens", max).put("system", system).put("messages", msgs)
             val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
             c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 10000; c.readTimeout = 15000
             c.setRequestProperty("x-api-key", key); c.setRequestProperty("anthropic-version", "2023-06-01"); c.setRequestProperty("content-type", "application/json")
@@ -388,7 +491,16 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
             JSONObject(c.inputStream.bufferedReader().readText()).getJSONArray("content").getJSONObject(0).getString("text")
         } catch (e: Exception) { Bus.post("info", "AI help failed: ${e.javaClass.simpleName}"); null }
     }
-    private fun aiAnswer(q: String) = claude("You are a voice assistant. Answer in at most 3 short spoken sentences, plain text, no markdown. The user may speak English, Hindi or Hinglish; answer in the same language.", q, 300)
+    private fun claude(system: String, user: String, max: Int) = claudeMsgs(system, JSONArray().put(JSONObject().put("role", "user").put("content", user)), max)
+    /** Chat answer with short memory of the conversation. */
+    private fun aiAnswer(q: String): String? {
+        val msgs = JSONArray()
+        synchronized(history) { history.takeLast(6).forEach { msgs.put(JSONObject().put("role", it.first).put("content", it.second)) } }
+        msgs.put(JSONObject().put("role", "user").put("content", q))
+        val r = claudeMsgs("You are ${prefs.assistantName}, a friendly voice assistant talking to ${prefs.callMe}. Answer in at most 3 short spoken sentences, plain text, no markdown. The user may speak English, Hindi or Hinglish; reply in the same language.", msgs, 300)
+        if (r != null) synchronized(history) { history.add("user" to q); history.add("assistant" to r); while (history.size > 12) history.removeAt(0) }
+        return r
+    }
     private fun aiInterpret(text: String): List<String>? {
         val r = claude("Convert a spoken phone command (English, Hindi or Hinglish, may contain speech-recognition mistakes) into JSON only: {\"cmds\":[...]}. " +
             "Allowed cmds: open <app>, play <youtube query>, yt_search <query>, search <query>, torch on, torch off, photo front, photo back, call <contact name>, media toggle, media next, media prev, " +
