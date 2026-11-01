@@ -8,6 +8,7 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
@@ -17,7 +18,7 @@ import java.util.Locale
 import kotlin.concurrent.thread
 import kotlin.math.sqrt
 
-/** Always-on foreground service: wake word -> speaker check -> command. Listening is fully offline. */
+/** Always-on service. One recogniser hears everything; "friday <command>" works in one breath. */
 class VoiceService : Service() {
     companion object { const val ACTION_ENROLL = "enroll"; const val SR = 16000f }
     private lateinit var prefs: Prefs
@@ -26,14 +27,25 @@ class VoiceService : Service() {
     @Volatile private var running = false
     @Volatile private var onMode = false
     @Volatile private var enrolling = false
+    @Volatile private var speaking = false
+    @Volatile private var muteUntil = 0L
+    @Volatile private var awakeUntil = 0L
+    private var spkModel: SpeakerModel? = null
 
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         prefs = Prefs(this)
-        tts = TextToSpeech(this) { tts.language = Locale.getDefault() }
-        router = CommandRouter(this, prefs, ::say) { onMode = it }
+        tts = TextToSpeech(this) {
+            tts.language = Locale("en", "IN")
+            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(id: String?) { speaking = true }
+                override fun onDone(id: String?) { speaking = false; muteUntil = System.currentTimeMillis() + 500 }
+                override fun onError(id: String?) { speaking = false }
+            })
+        }
+        router = CommandRouter(this, prefs, ::say) { onMode = it; OverlayBubble.state(if (it) 1 else 0) }
     }
 
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
@@ -48,60 +60,86 @@ class VoiceService : Service() {
         if (i?.action == ACTION_ENROLL) enrolling = true
         OverlayBubble.show(this)
         if (!running) { running = true; listen() }
-        return START_STICKY            // system restarts it if killed
+        return START_STICKY
     }
 
     private fun listen() = thread(name = "listen") {
-        // Models go in assets/model-en (e.g. vosk-model-small-en-in-0.4) and assets/model-spk (vosk-model-spk-0.4)
-        val model = try { Model(StorageService.sync(this, "model-en", "model")) } catch (e: Exception) { say("Voice model missing"); return@thread }
-        val spk = try { SpeakerModel(StorageService.sync(this, "model-spk", "spk")) } catch (e: Exception) { null }
-        val wake = prefs.wakeWord
-        // Tiny grammar = a very reliable wake word, even with music playing
-        val wakeRec = Recognizer(model, SR, "[\"$wake\", \"[unk]\"]")
-        val cmdRec = Recognizer(model, SR).also { r -> spk?.let { r.setSpeakerModel(it) } }
+        Bus.post("info", "Loading voice model…")
+        val model = try { Model(StorageService.sync(this, "model-en", "model")) } catch (e: Exception) { Bus.post("info", "Voice model missing"); say("Voice model missing"); return@thread }
+        spkModel = try { SpeakerModel(StorageService.sync(this, "model-spk", "spk")) } catch (e: Exception) { null }
+        val rec = Recognizer(model, SR).also { r -> spkModel?.let { r.setSpeakerModel(it) } }
         val bufSize = AudioRecord.getMinBufferSize(SR.toInt(), AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT) * 4
-        // VOICE_RECOGNITION source applies noise/echo suppression, which helps while media plays
-        val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, SR.toInt(), AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize)
-        rec.startRecording()
-        val buf = ByteArray(4096)
-        var awake = false; var lastHeard = 0L
+        val ar = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, SR.toInt(), AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize)
+        ar.startRecording()
+        Bus.post("info", "Ready. Say “${prefs.wakeWord}” + a command")
+        say("Yes ${prefs.callMe}, I am ready")
+        val buf = ByteArray(4096); var wasMuted = false
         while (running) {
-            val n = rec.read(buf, 0, buf.size); if (n <= 0) continue
-            if (enrolling) { enroll(rec, cmdRec); enrolling = false; continue }
-            if (!awake && !onMode) {
-                if (wakeRec.acceptWaveForm(buf, n) && JSONObject(wakeRec.result).optString("text").contains(wake)) {
-                    awake = true; lastHeard = System.currentTimeMillis(); cmdRec.reset()
-                }
-            } else if (cmdRec.acceptWaveForm(buf, n)) {
-                val j = JSONObject(cmdRec.result)
-                val text = j.optString("text").replace(wake, "").trim()
-                if (text.isNotEmpty() && isOwner(j)) { router.handle(text); lastHeard = System.currentTimeMillis() }
-                if (!onMode) awake = false
-            } else if (!onMode && System.currentTimeMillis() - lastHeard > 6000) awake = false
+            val n = ar.read(buf, 0, buf.size); if (n <= 0) continue
+            // Do not listen to our own voice
+            if (speaking || System.currentTimeMillis() < muteUntil) { if (!wasMuted) rec.reset(); wasMuted = true; continue }
+            wasMuted = false
+            if (enrolling) { enroll(ar, rec); enrolling = false; continue }
+            if (rec.acceptWaveForm(buf, n)) process(JSONObject(rec.result))
         }
-        rec.stop(); rec.release()
+        ar.stop(); ar.release()
     }
 
-    /** Speaker verification: cosine distance between enrolled x-vector and the current utterance. */
+    private fun process(j: JSONObject) {
+        val text = j.optString("text").trim(); if (text.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val tokens = text.split(" ")
+        val end = wakeEnd(tokens, prefs.wakeWord)
+        val cmd: String
+        if (end >= 0) {
+            cmd = tokens.drop(end).joinToString(" ")
+            Bus.post("heard", text)
+            if (cmd.isEmpty()) { awakeUntil = now + 8000; OverlayBubble.state(1); say("Yes ${prefs.callMe}"); return }
+        } else if (onMode || now < awakeUntil) { cmd = text; Bus.post("heard", text) }
+        else return
+        if (!isOwner(j)) { Bus.post("info", "Not recognised as your voice"); return }
+        awakeUntil = 0
+        if (!onMode) OverlayBubble.state(2)
+        router.handle(cmd, allowAsk = !onMode)
+        if (!onMode) OverlayBubble.state(0)
+    }
+
+    /** Index just after the wake word, tolerating small recognition errors (fry day, fridays). -1 if absent. */
+    private fun wakeEnd(t: List<String>, wake: String): Int {
+        for (i in t.indices) {
+            if (lev(t[i], wake) <= (if (wake.length >= 5) 1 else 0)) return i + 1
+            if (i + 1 < t.size && lev(t[i] + t[i + 1], wake) <= 1) return i + 2
+        }
+        return -1
+    }
+    private fun lev(a: String, b: String): Int {
+        val d = Array(a.length + 1) { IntArray(b.length + 1) }
+        for (i in 0..a.length) d[i][0] = i; for (j in 0..b.length) d[0][j] = j
+        for (i in 1..a.length) for (j in 1..b.length)
+            d[i][j] = minOf(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + if (a[i - 1] == b[j - 1]) 0 else 1)
+        return d[a.length][b.length]
+    }
+
     private fun isOwner(j: JSONObject): Boolean {
         val mine = prefs.voiceprintArray() ?: return true
         val a = j.optJSONArray("spk") ?: return true
         val cur = DoubleArray(a.length()) { a.getDouble(it) }
         var d = 0.0; var na = 0.0; var nb = 0.0
         for (i in mine.indices) { d += mine[i] * cur[i]; na += mine[i] * mine[i]; nb += cur[i] * cur[i] }
-        return 1 - d / (sqrt(na) * sqrt(nb)) < 0.5      // tune 0.4–0.6
+        return 1 - d / (sqrt(na) * sqrt(nb)) < 0.7
     }
 
-    private fun enroll(rec: AudioRecord, r: Recognizer) {
-        say("Speak for five seconds"); Thread.sleep(2500)
+    private fun enroll(ar: AudioRecord, r: Recognizer) {
+        if (spkModel == null) { say("Speaker model missing"); return }
+        say("Speak normally for five seconds"); Thread.sleep(3500)
         val buf = ByteArray(4096); val end = System.currentTimeMillis() + 5000
         r.reset()
-        while (System.currentTimeMillis() < end) { val n = rec.read(buf, 0, buf.size); if (n > 0) r.acceptWaveForm(buf, n) }
+        while (System.currentTimeMillis() < end) { val n = ar.read(buf, 0, buf.size); if (n > 0) r.acceptWaveForm(buf, n) }
         val a = JSONObject(r.finalResult).optJSONArray("spk")
         if (a != null) { prefs.voiceprint = (0 until a.length()).joinToString(",") { a.getDouble(it).toString() }; say("Voice saved") }
-        else say("Could not capture voice, try again")
+        else say("Could not capture your voice, try again")
     }
 
-    fun say(t: String) { tts.speak(t, TextToSpeech.QUEUE_FLUSH, null, "f") }
+    fun say(t: String) { Bus.post("reply", t); tts.speak(t, TextToSpeech.QUEUE_FLUSH, null, "f") }
     override fun onDestroy() { running = false; OverlayBubble.hide(this); tts.shutdown(); super.onDestroy() }
 }
