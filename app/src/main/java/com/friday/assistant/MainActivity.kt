@@ -66,6 +66,15 @@ class MainActivity : AppCompatActivity() {
         feed = TextView(this).apply { setTextColor(Color.WHITE); textSize = 14f; setPadding(0, dp(8), 0, 0); minLines = 4 }
         fc.addView(feed)
 
+        // test box: type a command to check execution separately from hearing
+        val tc = card(root, "TEST A COMMAND (no voice needed)")
+        val tin = input(tc, "e.g. open youtube  /  flashlight on", "")
+        tc.addView(pill("Run", false) {
+            val c = tin.text.toString().trim(); if (c.isNotEmpty()) {
+                prefs.enabled = true
+                ContextCompat.startForegroundService(this, Intent(this, VoiceService::class.java).setAction(VoiceService.ACTION_CMD).putExtra("text", c)); refresh() }
+        }, LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(8) })
+
         // setup checklist
         val sc = card(root, "SETUP  (tap a row that has ✗)")
         checks = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }; sc.addView(checks)

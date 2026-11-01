@@ -24,7 +24,29 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
         "photos" to "com.google.android.apps.photos", "phonepe" to "com.phonepe.app", "paytm" to "net.one97.paytm",
         "gpay" to "com.google.android.apps.nbu.paisa.user", "playstore" to "com.android.vending")
 
-    private fun launch(i: Intent): Boolean { i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); return try { ctx.startActivity(i); true } catch (e: Exception) { false } }
+    private fun launch(i: Intent): Boolean {
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        // Accessibility service context is allowed to start apps from the background on more phones
+        for (c in listOfNotNull<Context>(ControlService.inst, ctx)) { try { c.startActivity(i); return true } catch (e: Exception) { Bus.post("info", "Open failed: ${e.javaClass.simpleName}") } }
+        return false
+    }
+    private fun lev(a: String, b: String): Int {
+        val d = Array(a.length + 1) { IntArray(b.length + 1) }
+        for (i in 0..a.length) d[i][0] = i
+        for (j in 0..b.length) d[0][j] = j
+        for (i in 1..a.length) for (j in 1..b.length) d[i][j] = minOf(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + if (a[i - 1] == b[j - 1]) 0 else 1)
+        return d[a.length][b.length]
+    }
+    private val verbs = listOf("open", "launch", "play", "search", "pause", "resume", "next", "previous", "scroll", "volume", "flashlight", "torch")
+    /** Fix common mis-hearings so "flash light", "you tube", "opan" still work. */
+    private fun normalize(raw: String): String {
+        var t = raw.lowercase().trim().replace("you tube", "youtube").replace("whats app", "whatsapp").replace("what's app", "whatsapp")
+            .replace("flash light", "flashlight").replace("flashlite", "flashlight").replace("flash like", "flashlight").replace("flesh light", "flashlight")
+            .replace("torch light", "torch").replace("tourch", "torch").replace("switch on", "turn on").replace("switch off", "turn off")
+        val tok = t.split(" ").toMutableList()
+        for (i in 0 until minOf(2, tok.size)) { val w = tok[i]; if (w.length >= 4 && w !in verbs) verbs.firstOrNull { lev(w, it) <= 1 }?.let { tok[i] = it } }
+        return tok.joinToString(" ")
+    }
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
     private fun acc(): ControlService? {
         ControlService.inst?.let { return it }
@@ -35,7 +57,7 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
     }
 
     fun handle(raw: String, allowAsk: Boolean = true) {
-        val t = raw.lowercase().trim().replace("you tube", "youtube").replace("whats app", "whatsapp").replace("what's app", "whatsapp")
+        val t = normalize(raw)
         // ---- modes ----
         if (t.startsWith("go on mode") || t == "on mode") { setOnMode(true); return say("Yes ${prefs.callMe}, on mode") }
         if (t.startsWith("go off mode") || t == "off mode") { setOnMode(false); return say("Off mode") }
@@ -77,8 +99,11 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
         // ---- open apps ----
         if (t.startsWith("open ") || t.startsWith("launch ") || t.startsWith("start ")) return openApp(t.substringAfter(" ").trim())
         // ---- things that work with the screen off ----
-        if (t.contains("flashlight on") || t.contains("torch on")) return torch(true)
-        if (t.contains("flashlight off") || t.contains("torch off")) return torch(false)
+        if (t.contains("flashlight") || t.contains("torch")) {
+            val off = Regex("\\b(off|close|stop)\\b").containsMatchIn(t)
+            return torch(if (off) false else if (Regex("\\bon\\b").containsMatchIn(t)) true else !torchOn)
+        }
+        if (verbs.contains(t.split(" ")[0]).not() && pk.containsKey(t.replace(" ", ""))) return openApp(t)
         if (t.contains("time")) return say("It is " + java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault()).format(java.util.Date()))
         if (t.startsWith("set alarm")) { say("Opening alarms"); launch(Intent(AlarmClock.ACTION_SHOW_ALARMS)); return }
         if (t.contains("news") && (t.contains("today") || t.contains("latest") || t.contains("headline"))) { news(); return }
@@ -123,22 +148,32 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
 
     // ---------- apps ----------
     private fun openApp(spoken: String) {
-        val name = spoken.replace(" ", "")
+        fun norm(x: String) = x.lowercase().replace(Regex("[^a-z0-9]"), "")
+        val name = norm(spoken.removePrefix("the ").removePrefix("my "))
         val pm = ctx.packageManager
         if (name == "settings") { say("Opening settings"); launch(Intent(Settings.ACTION_SETTINGS)); return }
-        var intent = pk[name]?.let { pm.getLaunchIntentForPackage(it) }
-        if (intent == null) {
-            val li = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
-            val m = li.firstOrNull { it.loadLabel(pm).toString().lowercase().replace(" ", "") == name }
-                ?: li.firstOrNull { it.loadLabel(pm).toString().lowercase().replace(" ", "").contains(name) }
-            intent = m?.let { pm.getLaunchIntentForPackage(it.activityInfo.packageName) }
-        }
-        if (intent != null && launch(intent)) say("Opening $spoken") else say("I could not find $spoken")
+        val li = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+            .map { norm(it.loadLabel(pm).toString()) to it.activityInfo.packageName }
+        val tol = maxOf(1, name.length / 4)
+        var pkg: String? = pk.entries.firstOrNull { it.key == name || (name.length >= 5 && lev(it.key, name) <= 1) }?.value?.takeIf { pm.getLaunchIntentForPackage(it) != null }
+        if (pkg == null) pkg = li.firstOrNull { it.first == name }?.second
+        if (pkg == null && name.length >= 3) pkg = li.firstOrNull { it.first.contains(name) || (name.contains(it.first) && it.first.length >= 4) }?.second
+        if (pkg == null) pkg = li.filter { lev(it.first, name) <= tol }.minByOrNull { lev(it.first, name) }?.second
+        val intent = pkg?.let { pm.getLaunchIntentForPackage(it) }
+        if (intent != null && launch(intent)) say("Opening $spoken") else say("I could not open $spoken")
     }
 
+    private var torchOn = false
     private fun torch(on: Boolean) {
         val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        try { cm.setTorchMode(cm.cameraIdList[0], on); say(if (on) "Torch on" else "Torch off") } catch (e: Exception) { say("Torch not available") }
+        try {
+            val id = cm.cameraIdList.firstOrNull { val c = cm.getCameraCharacteristics(it)
+                c.get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true &&
+                c.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING) == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK }
+                ?: cm.cameraIdList.firstOrNull { cm.getCameraCharacteristics(it).get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true }
+                ?: return say("This phone has no flashlight")
+            cm.setTorchMode(id, on); torchOn = on; say(if (on) "Flashlight on" else "Flashlight off")
+        } catch (e: Exception) { say("Flashlight failed: ${e.javaClass.simpleName}") }
     }
 
     // ---------- calculator ----------
