@@ -1,5 +1,6 @@
 name: Build Friday APK
 on: { workflow_dispatch: {}, push: { branches: [main, master] } }
+permissions: { contents: write }
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,6 +27,12 @@ jobs:
           mv tmp-spk/* $A/model-spk
           uuidgen > $A/model-en/uuid
           uuidgen > $A/model-spk/uuid
-      - run: gradle assembleDebug --no-daemon
+      - run: gradle assembleDebug --no-daemon -PverCode=${{ github.run_number }}
       - uses: actions/upload-artifact@v4
         with: { name: Friday-APK, path: app/build/outputs/apk/debug/app-debug.apk }
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Friday build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
+          make_latest: true
