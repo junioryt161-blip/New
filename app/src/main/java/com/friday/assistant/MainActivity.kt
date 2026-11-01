@@ -22,6 +22,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var feed: TextView
     private lateinit var power: Button
     private lateinit var checks: LinearLayout
+    private lateinit var upText: TextView
+    private lateinit var upBtn: Button
+    private var pending: Updater.Info? = null
     private val BG = 0xFF0B1220.toInt(); private val CARD = 0xFF151F36.toInt(); private val ACC = 0xFF00E5FF.toInt(); private val MUT = 0xFF8FA3BF.toInt()
     private fun dp(i: Int) = (i * resources.displayMetrics.density).toInt()
 
@@ -55,6 +58,14 @@ class MainActivity : AppCompatActivity() {
         ht.addView(TextView(this).apply { text = "Voice assistant"; setTextColor(MUT); textSize = 13f })
         head.addView(ht); root.addView(head)
 
+        // updates
+        val uc = card(root, "UPDATES")
+        upText = TextView(this).apply { setTextColor(Color.WHITE); textSize = 14f; setPadding(0, dp(6), 0, 0) }
+        uc.addView(upText)
+        upBtn = pill("Check for update", false) { val p = pending; if (p != null) Updater.install(this, p) { m -> runOnUiThread { upText.text = m } } else checkUpdate() }
+        uc.addView(upBtn, LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(8) })
+        upText.text = "Installed build ${Updater.current(this)}"
+
         // power
         val pc = card(root, "ASSISTANT")
         power = pill("", true) { toggle() }
@@ -65,6 +76,34 @@ class MainActivity : AppCompatActivity() {
         val fc = card(root, "LIVE")
         feed = TextView(this).apply { setTextColor(Color.WHITE); textSize = 14f; setPadding(0, dp(8), 0, 0); minLines = 4 }
         fc.addView(feed)
+
+        // listening / smart settings
+        val lc = card(root, "LISTENING & SMARTS")
+        val gl = TextView(this).apply { setTextColor(Color.WHITE); textSize = 14f; setPadding(0, dp(8), 0, 0) }
+        fun gtxt(g: Float) = "Microphone sensitivity: ${"%.1f".format(g)}×  (higher hears you from further away / in noise)"
+        gl.text = gtxt(prefs.gain); lc.addView(gl)
+        lc.addView(SeekBar(this).apply { max = 70; progress = ((prefs.gain - 1f) * 10).toInt().coerceIn(0, 70)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { prefs.gain = 1f + p / 10f; gl.text = gtxt(prefs.gain) }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            }) }, LinearLayout.LayoutParams(-1, -2))
+        fun sw(label: String, on: Boolean, f: (Boolean) -> Unit) = Switch(this).apply { text = label; isChecked = on; setTextColor(Color.WHITE); setPadding(0, dp(8), 0, dp(4))
+            setOnCheckedChangeListener { _, v -> f(v) } }.also { lc.addView(it, LinearLayout.LayoutParams(-1, -2)) }
+        sw("Smart listening after “${prefs.wakeWord}” (Google speech, online – best for long commands & Hindi)", prefs.smart) { prefs.smart = it }
+        sw("Noisy-place mode (no echo cancelling, louder pickup) – restart needed", prefs.far) { prefs.far = it }
+        val langBtn = pill("", false) {}
+        fun ltxt() = "Speech language: " + if (prefs.lang == "hi-IN") "Hindi" else "English / Hinglish (India)"
+        langBtn.text = ltxt(); langBtn.setOnClickListener { prefs.lang = if (prefs.lang == "hi-IN") "en-IN" else "hi-IN"; langBtn.text = ltxt() }
+        lc.addView(langBtn, LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(8) })
+        val key = input(lc, "Optional: Claude API key for smarter understanding", prefs.aiKey)
+        lc.addView(pill("Save key", false) { prefs.aiKey = key.text.toString(); Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show() }, LinearLayout.LayoutParams(-1, dp(44)).apply { topMargin = dp(6) })
+        val learnedTxt = TextView(this).apply { setTextColor(MUT); textSize = 13f; setPadding(0, dp(10), 0, 0) }
+        fun lt() { learnedTxt.text = "Learned phrases: ${Learned.size()}" }
+        Learned.init(this); lt(); lc.addView(learnedTxt)
+        lc.addView(pill("Forget learned phrases", false) { Learned.clear(); lt() }, LinearLayout.LayoutParams(-1, dp(44)).apply { topMargin = dp(6) })
+        lc.addView(TextView(this).apply { setTextColor(MUT); textSize = 12f; setPadding(0, dp(10), 0, 0)
+            text = "Privacy: Friday never reads or uploads your screen, messages or OTPs, and switches itself off while a payment or banking app is open. With smart listening, your spoken command goes to Google’s speech service; only command text goes to the answer services." })
 
         // test box: type a command to check execution separately from hearing
         val tc = card(root, "TEST A COMMAND (no voice needed)")
@@ -97,6 +136,14 @@ class MainActivity : AppCompatActivity() {
         setContentView(ScrollView(this).apply { setBackgroundColor(BG); addView(root) })
     }
 
+    private fun checkUpdate() {
+        upText.text = "Checking…"
+        Updater.check(this) { info, err -> runOnUiThread {
+            pending = info
+            upText.text = when { err != null -> err; info != null -> "Update available: build ${info.code} (you have ${Updater.current(this)})"; else -> "You are up to date (build ${Updater.current(this)})" }
+            upBtn.text = if (info != null) "⬆  Update now" else "Check for update"
+        } }
+    }
     private fun toggle() {
         val i = Intent(this, VoiceService::class.java)
         if (prefs.enabled) { prefs.enabled = false; stopService(i) } else { prefs.enabled = true; ContextCompat.startForegroundService(this, i) }
@@ -116,11 +163,13 @@ class MainActivity : AppCompatActivity() {
             if (Build.VERSION.SDK_INT >= 33) p += Manifest.permission.POST_NOTIFICATIONS
             ActivityCompat.requestPermissions(this, p.toTypedArray(), 1)
         }
+        row(listOf(Manifest.permission.READ_CONTACTS, Manifest.permission.CALL_PHONE).all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }, "Contacts & calling (“call mummy”)") {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_CONTACTS, Manifest.permission.CALL_PHONE), 2) }
         row(Settings.canDrawOverlays(this), "Show over other apps (floating logo)") { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) }
         row(accOn(), "Accessibility (scroll, tap, type in apps)") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
         row(pm.isIgnoringBatteryOptimizations(packageName), "Run without battery limits") { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) }
         synchronized(Bus.lines) { feed.text = if (Bus.lines.isEmpty()) "Nothing yet…" else Bus.lines.takeLast(8).joinToString("\n") }
     }
-    override fun onResume() { super.onResume(); Bus.onLine = { refresh() }; refresh() }
+    override fun onResume() { super.onResume(); Bus.onLine = { refresh() }; refresh(); if (pending == null) checkUpdate() }
     override fun onPause() { super.onPause(); Bus.onLine = null }
 }

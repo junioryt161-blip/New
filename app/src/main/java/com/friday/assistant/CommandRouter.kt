@@ -1,22 +1,37 @@
 package com.friday.assistant
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.net.Uri
 import android.provider.AlarmClock
+import android.provider.ContactsContract
+import android.provider.MediaStore
 import android.provider.Settings
 import android.view.KeyEvent
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.concurrent.thread
 
+/**
+ * Understands a command in 3 steps:  clean (Hindi/Hinglish/synonyms) -> resolve (to a small command language) -> execute.
+ * Anything it cannot resolve can go to an online AI (optional key). Understood commands are remembered.
+ */
 class CommandRouter(private val ctx: Context, private val prefs: Prefs, private val say: (String) -> Unit, private val setOnMode: (Boolean) -> Unit) {
+    init { Learned.init(ctx) }
     private val audio = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    private var lastIds = listOf<String>()
+    private var lastIds = listOf<String>(); private var lastIdsAt = 0L
     private var newsTitles = listOf<String>()
+    private var torchOn = false
     private val ordinals = mapOf("first" to 1, "1st" to 1, "second" to 2, "2nd" to 2, "third" to 3, "3rd" to 3, "fourth" to 4, "4th" to 4, "fifth" to 5, "5th" to 5)
     private val pk = mapOf("youtube" to "com.google.android.youtube", "whatsapp" to "com.whatsapp", "chrome" to "com.android.chrome",
         "gmail" to "com.google.android.gm", "maps" to "com.google.android.apps.maps", "instagram" to "com.instagram.android",
@@ -24,12 +39,189 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
         "photos" to "com.google.android.apps.photos", "phonepe" to "com.phonepe.app", "paytm" to "net.one97.paytm",
         "gpay" to "com.google.android.apps.nbu.paisa.user", "playstore" to "com.android.vending")
 
+    // ---------------- language clean-up: Hindi / Hinglish / synonyms / mishearings ----------------
+    private val latin = listOf(
+        "you tube" to "youtube", "yu tube" to "youtube", "u tube" to "youtube", "whats app" to "whatsapp", "whatsap" to "whatsapp", "watsapp" to "whatsapp",
+        "flash light" to "torch", "flashlight" to "torch", "flashlite" to "torch", "flash like" to "torch", "torch light" to "torch", "tourch" to "torch", "roshni" to "torch", "batti" to "torch",
+        "in to" to "into", "whats" to "what is", "what s" to "what is",
+        "khol do" to "open", "kholiye" to "open", "kholo" to "open", "khol" to "open",
+        "baja do" to "play", "bajao" to "play", "chala do" to "play", "chalao" to "play", "laga do" to "play", "lagao" to "play",
+        "dhundho" to "search", "dhundo" to "search", "khojo" to "search", "serach" to "search", "sarch" to "search",
+        "chalu" to "on", "jala do" to "on", "jalao" to "on", "bujha do" to "off", "bujhao" to "off", "bandh" to "off", "band" to "off",
+        "agla" to "next", "aage" to "next", "pichla" to "previous", "peeche" to "previous", "ruk jao" to "pause", "ruko" to "pause",
+        "awaaz badhao" to "volume up", "awaz badhao" to "volume up", "volume badhao" to "volume up",
+        "awaaz kam karo" to "volume down", "awaz kam karo" to "volume down", "volume kam karo" to "volume down",
+        "photo kheencho" to "take photo", "photo khicho" to "take photo", "photo kheech" to "take photo", "photo lo" to "take photo", "tasveer" to "photo",
+        "selfy" to "selfie", "selfi" to "selfie", "gaana" to "song", "gana" to "song", "naya" to "new",
+        "kar do" to "", "karo" to "", "kijiye" to "", "kijiyega" to "")
+    private val latinRx = latin.map { Regex("\\b" + Regex.escape(it.first) + "\\b") to it.second }
+    private val deva = listOf("खोलिए" to "open", "खोलो" to "open", "चला दो" to "play", "चलाओ" to "play", "बजाओ" to "play", "लगाओ" to "play",
+        "बंद करो" to "off", "बंद" to "off", "चालू करो" to "on", "चालू" to "on", "टॉर्च" to "torch", "टार्च" to "torch", "यूट्यूब" to "youtube",
+        "व्हाट्सएप" to "whatsapp", "वॉट्सऐप" to "whatsapp", "कैमरा" to "camera", "कॉल" to "call", "खोजो" to "search", "ढूंढो" to "search", "सर्च" to "search",
+        "अगला" to "next", "पिछला" to "previous", "रुको" to "pause", "गाना" to "song", "मम्मी" to "mummy", "पापा" to "papa", "सेल्फी" to "selfie",
+        "फोटो" to "photo", "खींचो" to "take", "समय" to "time", "टाइम" to "time", "खबर" to "news", "समाचार" to "news", "न्यूज" to "news", "ऑन" to "on", "ऑफ" to "off",
+        "आवाज बढ़ाओ" to "volume up", "आवाज कम करो" to "volume down")
+    private val filler = Regex("\\b(?:please|kindly|hey|okay|ok|just|can you|could you|will you|would you|for me|mujhe|mere liye|zara|jara|jaldi|abhi|ek baar)\\b")
+
+    fun clean(raw: String): String {
+        var t = raw.lowercase().trim().replace(Regex("[,!?;:\"“”।]"), " ").replace("'", "").replace("’", "")
+        for ((a, b) in deva) t = t.replace(a, " $b ")
+        for ((r, w) in latinRx) t = t.replace(r, w)
+        return t.replace(filler, " ").replace(Regex("\\s+"), " ").trim()
+    }
+
+    // ---------------- resolve: text -> command list ----------------
+    private val starts = setOf("open", "play", "search", "call", "take", "click", "torch", "scroll", "next", "previous", "pause", "volume", "send", "type", "write",
+        "go", "tell", "what", "set", "stop", "turn", "photo", "selfie", "camera", "select", "tap", "press", "swipe", "resume", "find", "launch")
+    private fun has(t: String, vararg w: String) = w.any { Regex("\\b" + Regex.escape(it) + "\\b").containsMatchIn(t) }
+
+    fun resolve(raw: String): List<String> {
+        val t = clean(raw); if (t.isEmpty()) return emptyList()
+        Learned.get(t)?.let { return it.split("||") }
+        val out = mutableListOf<String>()
+        for (p in splitChain(t)) out += (parseOne(p) ?: "unknown $p")
+        // "open camera" + "take photo"  ->  just take the photo; "open youtube" + "play x" -> just play
+        val r = mutableListOf<String>()
+        for ((i, c) in out.withIndex()) {
+            val nx = out.getOrNull(i + 1)
+            if (nx != null && ((c == "open camera" && nx.startsWith("photo")) || (c == "open youtube" && (nx.startsWith("play ") || nx.startsWith("yt_search "))))) continue
+            r += c
+        }
+        return r
+    }
+    fun understands(raw: String): Boolean { val r = resolve(raw); return r.isNotEmpty() && r.none { it.startsWith("unknown ") || it.startsWith("ask ") } }
+
+    private fun splitChain(t: String): List<String> {
+        val out = mutableListOf<String>()
+        for (s in t.split(Regex("\\s+(?:and then|then|phir|uske baad|aur phir|and|aur)\\s+")).map { it.trim() }.filter { it.isNotEmpty() }) {
+            if (out.isNotEmpty() && s.split(" ")[0] !in starts) out[out.size - 1] = out.last() + " and " + s else out += s
+        }
+        return out
+    }
+
+    private fun parseOne(t: String): String? {
+        if (t.isEmpty()) return null
+        val tok = t.split(" "); val lead = tok[0]
+        Regex("^(?:go )?(on|off) mode$").find(t)?.let { return "mode " + it.groupValues[1] }
+        if (Regex("^(?:stop|quiet|be quiet|cancel|enough|shut up|silence)(?: talking)?$").matches(t)) return "silence"
+        if (lead != "play" && lead != "search" && tok.size <= 7 && (has(t, "torch") || (has(t, "light", "lights", "lamp") && has(t, "on", "off")))) {
+            val off = has(t, "off", "close", "disable", "stop"); val on = has(t, "on", "enable", "start")
+            return if (off) "torch off" else if (on) "torch on" else "torch toggle"
+        }
+        if (lead != "play" && has(t, "photo", "picture", "pic", "selfie", "snap") && (has(t, "take", "click", "capture", "snap", "selfie") || t == "photo"))
+            return if (has(t, "selfie", "front")) "photo front" else "photo back"
+        Regex("^(?:call|dial|phone|ring)\\s+(.+)$").find(t)?.let { return "call " + it.groupValues[1].removePrefix("to ").removeSuffix(" ko").trim() }
+        Regex("^(.+?)\\s+ko\\s+(?:call|phone|dial)$").find(t)?.let { return "call " + it.groupValues[1] }
+        if (t != "search" && Regex("^(?:open )?(?:the )?search(?: bar| box)?$").matches(t)) return "searchbar"
+        if (t == "play music" || t == "play my music" || t == "play songs") return "music"
+        Regex("^(?:play|open|select|pick|choose)\\s+(?:the\\s+)?(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)(?:\\s+\\w+)?$").find(t)?.let { return "nth " + ordinals[it.groupValues[1]] }
+        if (Regex("^(?:play|resume|pause|play video|pause video|stop video|play song|pause song)$").matches(t)) return "media toggle"
+        Regex("^(?:search|find|look up|look for)\\s+(?:for\\s+)?(.+?)\\s+(?:on|in|at)\\s+youtube$").find(t)?.let { return "yt_search " + it.groupValues[1] }
+        Regex("^youtube\\s+(?:search|par search|pe search)\\s+(.+)$").find(t)?.let { return "yt_search " + it.groupValues[1] }
+        var q: String? = Regex("^(?:play|put on)\\s+(.+)$").find(t)?.groupValues?.get(1)
+        if (q == null) q = Regex("^youtube\\s+(?:pe|par|me|mein|on)\\s+(.+?)(?:\\s+play)?$").find(t)?.groupValues?.get(1)
+        if (q == null) q = Regex("^(.+?\\s(?:song|songs|video|videos|trailer))\\s+(?:on|in|pe|par)\\s+youtube$").find(t)?.groupValues?.get(1)
+        if (q == null) q = Regex("^(.+?)\\s+play$").find(t)?.groupValues?.get(1)
+        if (q != null) {
+            val s = q.replace(Regex("\\s+(?:on|in|from|at|pe|par)\\s+youtube$"), "").replace(Regex("^(?:the|a)\\s+"), "").trim()
+            if (s.isNotEmpty()) return "play $s"
+        }
+        when {
+            Regex("^(?:next|next video|next song|next track)$").matches(t) -> return "media next"
+            Regex("^(?:previous|previous video|previous song|previous track)$").matches(t) -> return "media prev"
+            Regex("^(?:next short|next reel|scroll down|swipe up|scroll)$").matches(t) -> return "scroll down"
+            Regex("^(?:previous short|previous reel|scroll up|swipe down)$").matches(t) -> return "scroll up"
+            t == "swipe left" -> return "swipe left"
+            t == "swipe right" -> return "swipe right"
+            Regex("^(?:volume up|increase volume|louder|volume increase)$").matches(t) -> return "volume up"
+            Regex("^(?:volume down|decrease volume|lower volume|volume decrease|quieter)$").matches(t) -> return "volume down"
+            t == "send" || t == "send message" -> return "send"
+            t == "back" || t == "go back" -> return "back"
+            t == "home" || t == "go home" -> return "home"
+            t == "write message" || t == "type message" -> return "typemode"
+        }
+        Regex("^(?:click|tap|press|touch)\\s+(?:on\\s+)?(.+)$").find(t)?.let { return "click " + it.groupValues[1] }
+        Regex("^(?:type|write)\\s+(.+)$").find(t)?.let { return "type " + it.groupValues[1] }
+        if (Regex("^(?:what is the time|time|what time is it|tell me the time|current time|what is time)$").matches(t)) return "time"
+        if (Regex("^(?:date|what is the date|todays date|what is todays date|what day is it|what is the day today)$").matches(t)) return "date"
+        if (has(t, "news", "headlines") && lead != "play") return "news"
+        Regex("^(?:search|find|look up|look for|google)\\s+(?:for\\s+)?(.+)$").find(t)?.let { return "search " + it.groupValues[1] }
+        if (Mathx.intent(t)) return "math $t"
+        Regex("^(?:open|launch|start|run|go to|show)\\s+(?:the\\s+)?(.+?)(?:\\s+app)?$").find(t)?.let { return "open " + it.groupValues[1] }
+        if (tok.size <= 3 && findPkg(t.removeSuffix(" app")) != null) return "open " + t.removeSuffix(" app")
+        if (Regex("^(?:what|who|when|where|why|how|which|tell me|explain|define|is |are |can |kya|kaun|kab|kahan|kyun|kaise|kitna)").containsMatchIn(t)) return "ask $t"
+        return null
+    }
+
+    // ---------------- main entry ----------------
+    fun handle(raw: String, allowAsk: Boolean = true) {
+        val cleaned = clean(raw)
+        Regex("^(?:learn|remember)(?: that)?\\s+(.+?)\\s+(?:means|mean|is)\\s+(.+)$").find(cleaned)?.let { m ->
+            val v = resolve(m.groupValues[2])
+            if (v.isNotEmpty() && v.none { it.startsWith("unknown ") }) { Learned.put(clean(m.groupValues[1]), v.joinToString("||")); say("Learned. When you say ${m.groupValues[1]}, I will do ${m.groupValues[2]}") }
+            else say("I did not understand what to do for that")
+            return
+        }
+        var cmds = resolve(raw)
+        var viaAi = false
+        if (cmds.any { it.startsWith("unknown ") }) {
+            if (!allowAsk) { Bus.post("info", "Ignored: $cleaned"); return }
+            val ai = aiInterpret(cleaned)
+            if (ai != null && ai.isNotEmpty()) { cmds = ai; viaAi = true } else cmds = listOf("ask $cleaned")
+        } else if (!allowAsk && cmds.size == 1 && cmds[0].startsWith("ask ")) { Bus.post("info", "Ignored: $cleaned"); return }
+        Bus.post("info", "→ " + cmds.joinToString(" ; "))
+        var ok = true
+        for ((i, c) in cmds.withIndex()) { ok = exec(c) && ok; if (i < cmds.size - 1) Thread.sleep(if (c.startsWith("open ")) 2500 else 700) }
+        val learnable = cmds.all { it.startsWith("torch") || it.startsWith("open ") || it.startsWith("media") || it.startsWith("scroll") || it.startsWith("volume") || it == "time" || it == "news" || it.startsWith("photo") }
+        if (ok && (viaAi || (learnable && cleaned != cmds.joinToString(" ")))) Learned.put(cleaned, cmds.joinToString("||"))
+    }
+
+    private fun exec(c: String): Boolean {
+        val sp = c.indexOf(' '); val verb = if (sp < 0) c else c.substring(0, sp); val arg = if (sp < 0) "" else c.substring(sp + 1).trim()
+        return when (verb) {
+            "mode" -> { setOnMode(arg == "on"); say(if (arg == "on") "Yes ${prefs.callMe}, on mode" else "Off mode"); true }
+            "silence" -> true
+            "torch" -> torch(if (arg == "toggle") !torchOn else arg == "on")
+            "photo" -> takePhoto(arg == "front")
+            "call" -> callContact(arg)
+            "play" -> { youtube(arg, true); true }
+            "yt_search" -> { youtube(arg, false); true }
+            "nth" -> playNth(arg.toIntOrNull() ?: 1)
+            "music" -> { if (!launch(Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_MUSIC))) { say("No music app found"); false } else { say("Opening music"); true } }
+            "media" -> { mediaKey(when (arg) { "next" -> KeyEvent.KEYCODE_MEDIA_NEXT; "prev" -> KeyEvent.KEYCODE_MEDIA_PREVIOUS; else -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE }); true }
+            "scroll" -> acc()?.swipe(arg == "down") ?: false
+            "swipe" -> acc()?.swipeH(arg == "left") ?: false
+            "volume" -> { audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, if (arg == "up") AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI); true }
+            "searchbar" -> { val a = acc(); if (a != null && a.clickText("search")) true else { say("I could not find a search bar here"); false } }
+            "search" -> if (inApp()) inAppSearch(arg) else { say("Searching $arg"); launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + enc(arg)))) }
+            "click" -> { val a = acc(); if (a != null && a.clickText(arg)) true else { say("I could not find $arg on the screen"); false } }
+            "type" -> acc()?.typeText(arg, append = true) ?: false
+            "typemode" -> { acc()?.focusEditable(); setOnMode(true); say("Say your message, then say send"); true }
+            "send" -> acc()?.clickText("send") ?: false
+            "back" -> acc()?.back() ?: false
+            "home" -> acc()?.home() ?: false
+            "time" -> { say("It is " + SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date())); true }
+            "date" -> { say("Today is " + SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()).format(Date())); true }
+            "news" -> { news(); true }
+            "open" -> openApp(arg)
+            "math" -> { math(arg); true }
+            "ask" -> { ask(arg); true }
+            else -> { ask(c); true }
+        }
+    }
+
+    // ---------------- helpers ----------------
+    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
     private fun launch(i: Intent): Boolean {
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        // Accessibility service context is allowed to start apps from the background on more phones
         for (c in listOfNotNull<Context>(ControlService.inst, ctx)) { try { c.startActivity(i); return true } catch (e: Exception) { Bus.post("info", "Open failed: ${e.javaClass.simpleName}") } }
         return false
     }
+    private fun acc(): ControlService? {
+        ControlService.inst?.let { return it }
+        say("Please turn on Friday in accessibility settings"); launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)); return null
+    }
+    private fun mediaKey(code: Int) { audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code)); audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code)) }
     private fun lev(a: String, b: String): Int {
         val d = Array(a.length + 1) { IntArray(b.length + 1) }
         for (i in 0..a.length) d[i][0] = i
@@ -37,88 +229,30 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
         for (i in 1..a.length) for (j in 1..b.length) d[i][j] = minOf(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + if (a[i - 1] == b[j - 1]) 0 else 1)
         return d[a.length][b.length]
     }
-    private val verbs = listOf("open", "launch", "play", "search", "pause", "resume", "next", "previous", "scroll", "volume", "flashlight", "torch")
-    /** Fix common mis-hearings so "flash light", "you tube", "opan" still work. */
-    private fun normalize(raw: String): String {
-        var t = raw.lowercase().trim().replace("you tube", "youtube").replace("whats app", "whatsapp").replace("what's app", "whatsapp")
-            .replace("flash light", "flashlight").replace("flashlite", "flashlight").replace("flash like", "flashlight").replace("flesh light", "flashlight")
-            .replace("torch light", "torch").replace("tourch", "torch").replace("switch on", "turn on").replace("switch off", "turn off")
-        val tok = t.split(" ").toMutableList()
-        for (i in 0 until minOf(2, tok.size)) { val w = tok[i]; if (w.length >= 4 && w !in verbs) verbs.firstOrNull { lev(w, it) <= 1 }?.let { tok[i] = it } }
-        return tok.joinToString(" ")
+    private fun norm(x: String) = x.lowercase().replace(Regex("[^a-z0-9]"), "")
+
+    private fun inApp(): Boolean {
+        val p = Foreground.pkg ?: return false
+        if (ControlService.inst == null || p == ctx.packageName) return false
+        val home = ctx.packageManager.resolveActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0)?.activityInfo?.packageName
+        return p != home
     }
-    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
-    private fun acc(): ControlService? {
-        ControlService.inst?.let { return it }
-        say("Please turn on Friday in accessibility settings"); launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)); return null
-    }
-    private fun mediaKey(code: Int) {
-        audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code)); audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+    private fun inAppSearch(q: String): Boolean {
+        val a = acc() ?: return false
+        if (!a.clickText("search")) { say("I could not find a search box in this app"); return false }
+        Thread.sleep(900)
+        if (!a.typeText(q)) { say("I could not type in the search box"); return false }
+        Thread.sleep(500)
+        if (!a.imeEnter()) a.clickText("search")
+        say("Searching $q"); return true
     }
 
-    fun handle(raw: String, allowAsk: Boolean = true) {
-        val t = normalize(raw)
-        // ---- modes ----
-        if (t.startsWith("go on mode") || t == "on mode") { setOnMode(true); return say("Yes ${prefs.callMe}, on mode") }
-        if (t.startsWith("go off mode") || t == "off mode") { setOnMode(false); return say("Off mode") }
-        // ---- calculator (spoken numbers become digits) ----
-        calcOrNull(t)?.let { return say("It is $it") }
-        // ---- YouTube ----
-        Regex("^(?:open youtube(?: and)? )?(play|search)\\s+(.+?)(?:\\s+(?:on|in|from)\\s+youtube)?$").find(t)?.let { m ->
-            val q = m.groupValues[2]
-            val isPlay = m.groupValues[1] == "play"
-            when {
-                q.startsWith("the ") && ordinals.keys.any { q.contains(it) } -> playNth(q)
-                q == "music" || q == "my music" || q == "songs" -> { if (!launch(Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_MUSIC))) say("No music app found"); return }
-                isPlay || t.contains("youtube") -> youtube(q, isPlay)
-                else -> { say("Searching $q"); launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + enc(q)))) }
-            }
-            return
-        }
-        Regex("^(?:play|open)\\s+(?:the\\s+)?(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\\s+(?:video|one|result)").find(t)?.let { return playNth(t) }
-        // ---- playback keys (work in YouTube, Spotify, music apps) ----
-        when (t) {
-            "pause", "play", "resume", "stop video", "pause video", "play video" -> return mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
-            "next", "next video", "next song" -> return mediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
-            "previous", "previous video", "previous song" -> return mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-            "next short", "scroll down", "swipe up" -> return run { acc()?.swipe(true) }.let { }
-            "previous short", "scroll up", "swipe down" -> return run { acc()?.swipe(false) }.let { }
-            "go back", "back" -> return run { acc()?.back() }.let { }
-            "go home", "home" -> return run { acc()?.home() }.let { }
-            "volume up" -> return audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
-            "volume down" -> return audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
-            "send", "send message" -> return run { acc()?.clickText("send") }.let { }
-            "write message", "type message" -> return run { acc()?.focusEditable(); say("Say your message") }.let { setOnMode(true) }
-        }
-        if (t.startsWith("write ") || t.startsWith("type ")) return run { acc()?.typeText(t.substringAfter(" "), append = true) }.let { }
-        if (t.startsWith("open ") && t.endsWith(" chat")) {
-            val who = t.removePrefix("open ").removeSuffix(" chat").trim()
-            val a = acc() ?: return
-            a.clickText("search"); Thread.sleep(800); a.typeText(who); Thread.sleep(1500); a.clickNth(1, who); return
-        }
-        // ---- open apps ----
-        if (t.startsWith("open ") || t.startsWith("launch ") || t.startsWith("start ")) return openApp(t.substringAfter(" ").trim())
-        // ---- things that work with the screen off ----
-        if (t.contains("flashlight") || t.contains("torch")) {
-            val off = Regex("\\b(off|close|stop)\\b").containsMatchIn(t)
-            return torch(if (off) false else if (Regex("\\bon\\b").containsMatchIn(t)) true else !torchOn)
-        }
-        if (verbs.contains(t.split(" ")[0]).not() && pk.containsKey(t.replace(" ", ""))) return openApp(t)
-        if (t.contains("time")) return say("It is " + java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault()).format(java.util.Date()))
-        if (t.startsWith("set alarm")) { say("Opening alarms"); launch(Intent(AlarmClock.ACTION_SHOW_ALARMS)); return }
-        if (t.contains("news") && (t.contains("today") || t.contains("latest") || t.contains("headline"))) { news(); return }
-        if (t.startsWith("tell me about") && newsTitles.isNotEmpty() && t.contains("news")) {
-            val n = ordinals.entries.firstOrNull { t.contains(it.key) }?.value ?: 1; ask(newsTitles.getOrNull(n - 1) ?: return); return
-        }
-        if (allowAsk) ask(t) else Bus.post("info", "Ignored: $t")
-    }
-
-    // ---------- YouTube: find the video and open it directly ----------
+    // ---------------- YouTube ----------------
     private fun youtube(q: String, play: Boolean) {
         say(if (play) "Playing $q" else "Searching $q on YouTube")
         thread {
             try {
-                val ids = ytSearch(q); lastIds = ids
+                val ids = ytSearch(q); lastIds = ids; lastIdsAt = System.currentTimeMillis()
                 if (play && ids.isNotEmpty()) playId(ids[0])
                 else launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=" + enc(q))).setPackage("com.google.android.youtube"))
             } catch (e: Exception) {
@@ -127,10 +261,10 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
             }
         }
     }
-    private fun playNth(t: String) {
-        val n = ordinals.entries.firstOrNull { t.contains(it.key) }?.value ?: 1
-        val id = lastIds.getOrNull(n - 1) ?: return say("Search for something on YouTube first")
-        say("Playing video $n"); playId(id)
+    private fun playNth(n: Int): Boolean {
+        if (lastIds.isNotEmpty() && System.currentTimeMillis() - lastIdsAt < 600000) { say("Playing video $n"); playId(lastIds.getOrNull(n - 1) ?: return false); return true }
+        val a = acc() ?: return false
+        return a.clickNth(n, "play video", "views", "ago")
     }
     private fun playId(id: String) {
         if (!launch(Intent(Intent.ACTION_VIEW, Uri.parse("vnd.youtube:$id")).setPackage("com.google.android.youtube")))
@@ -146,61 +280,121 @@ class CommandRouter(private val ctx: Context, private val prefs: Prefs, private 
         return if (a.isNotEmpty()) a else Regex("\"videoId\":\"([\\w-]{11})\"").findAll(html).map { it.groupValues[1] }.distinct().toList()
     }
 
-    // ---------- apps ----------
-    private fun openApp(spoken: String) {
-        fun norm(x: String) = x.lowercase().replace(Regex("[^a-z0-9]"), "")
-        val name = norm(spoken.removePrefix("the ").removePrefix("my "))
+    // ---------------- apps ----------------
+    private fun findPkg(spoken: String): String? {
+        val name = norm(spoken.removePrefix("the ").removePrefix("my ")); if (name.length < 2) return null
         val pm = ctx.packageManager
-        if (name == "settings") { say("Opening settings"); launch(Intent(Settings.ACTION_SETTINGS)); return }
-        val li = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
-            .map { norm(it.loadLabel(pm).toString()) to it.activityInfo.packageName }
-        val tol = maxOf(1, name.length / 4)
-        var pkg: String? = pk.entries.firstOrNull { it.key == name || (name.length >= 5 && lev(it.key, name) <= 1) }?.value?.takeIf { pm.getLaunchIntentForPackage(it) != null }
-        if (pkg == null) pkg = li.firstOrNull { it.first == name }?.second
-        if (pkg == null && name.length >= 3) pkg = li.firstOrNull { it.first.contains(name) || (name.contains(it.first) && it.first.length >= 4) }?.second
-        if (pkg == null) pkg = li.filter { lev(it.first, name) <= tol }.minByOrNull { lev(it.first, name) }?.second
-        val intent = pkg?.let { pm.getLaunchIntentForPackage(it) }
-        if (intent != null && launch(intent)) say("Opening $spoken") else say("I could not open $spoken")
+        pk.entries.firstOrNull { it.key == name || (name.length >= 5 && lev(it.key, name) <= 1) }?.value?.takeIf { pm.getLaunchIntentForPackage(it) != null }?.let { return it }
+        val li = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0).map { norm(it.loadLabel(pm).toString()) to it.activityInfo.packageName }
+        li.firstOrNull { it.first == name }?.let { return it.second }
+        if (name.length >= 4) li.firstOrNull { it.first.contains(name) || (name.contains(it.first) && it.first.length >= 4) }?.let { return it.second }
+        val tol = if (name.length >= 6) maxOf(1, name.length / 4) else 0
+        if (tol > 0) li.filter { lev(it.first, name) <= tol }.minByOrNull { lev(it.first, name) }?.let { return it.second }
+        return null
+    }
+    private fun openApp(spoken: String): Boolean {
+        if (norm(spoken) == "settings") { say("Opening settings"); return launch(Intent(Settings.ACTION_SETTINGS)) }
+        val intent = findPkg(spoken)?.let { ctx.packageManager.getLaunchIntentForPackage(it) }
+        return if (intent != null && launch(intent)) { say("Opening $spoken"); true } else { say("I could not open $spoken"); false }
     }
 
-    private var torchOn = false
-    private fun torch(on: Boolean) {
+    // ---------------- torch ----------------
+    private fun torch(on: Boolean): Boolean {
         val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        try {
-            val id = cm.cameraIdList.firstOrNull { val c = cm.getCameraCharacteristics(it)
-                c.get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true &&
-                c.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING) == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK }
-                ?: cm.cameraIdList.firstOrNull { cm.getCameraCharacteristics(it).get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true }
-                ?: return say("This phone has no flashlight")
-            cm.setTorchMode(id, on); torchOn = on; say(if (on) "Flashlight on" else "Flashlight off")
-        } catch (e: Exception) { say("Flashlight failed: ${e.javaClass.simpleName}") }
+        return try {
+            val id = cm.cameraIdList.firstOrNull { val ch = cm.getCameraCharacteristics(it); ch.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true && ch.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK }
+                ?: cm.cameraIdList.firstOrNull { cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true }
+            if (id == null) { say("This phone has no flashlight"); false } else { cm.setTorchMode(id, on); torchOn = on; say(if (on) "Flashlight on" else "Flashlight off"); true }
+        } catch (e: Exception) { say("Flashlight failed: ${e.javaClass.simpleName}"); false }
     }
 
-    // ---------- calculator ----------
-    private fun calcOrNull(t: String): String? {
-        var e = Words.toDigits(t).replace(Regex("^(what is|what's|calculate|tell me|how much is)\\s*"), "")
-            .replace("multiplied by", "*").replace("divided by", "/").replace("times", "*").replace("into", "*")
-            .replace("plus", "+").replace("minus", "-").replace("over", "/").replace(Regex("\\bx\\b"), "*").replace(" ", "")
-        if (!Regex("^[0-9.+\\-*/]+$").matches(e) || !Regex("[0-9][+\\-*/][0-9]").containsMatchIn(e)) return null
-        return try { val r = Eval.run(e); if (r % 1.0 == 0.0) r.toLong().toString() else "%.4f".format(r).trimEnd('0') } catch (x: Exception) { null }
+    // ---------------- camera: open it and press the shutter ----------------
+    private fun takePhoto(front: Boolean): Boolean {
+        val a = acc() ?: return false
+        say(if (front) "Opening front camera" else "Opening camera")
+        if (!(Foreground.pkg ?: "").contains("camera")) {
+            val i = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
+            if (front) { i.putExtra("android.intent.extras.CAMERA_FACING", 1); i.putExtra("android.intent.extras.LENS_FACING_FRONT", 1); i.putExtra("android.intent.extra.USE_FRONT_CAMERA", true) }
+            if (!launch(i)) { say("I could not open the camera"); return false }
+            Thread.sleep(2300)
+        }
+        if (front) a.clickText("switch to front", "selfie") else a.clickText("switch to rear", "switch to back")
+        Thread.sleep(900)
+        say("Smile. 3, 2, 1"); Thread.sleep(3500)
+        var ok = false
+        for (k in 0 until 8) { if (a.clickText("shutter", "take photo", "take picture", "capture")) { ok = true; break }; Thread.sleep(500) }
+        if (!ok) ok = a.tap(ctx.resources.displayMetrics.widthPixels / 2f, ctx.resources.displayMetrics.heightPixels * 0.88f)
+        Thread.sleep(900); say(if (ok) "Photo taken" else "I could not press the shutter"); return ok
     }
 
-    // ---------- online answers ----------
-    private fun news() = thread {
+    // ---------------- contacts & calling (stays on the phone) ----------------
+    private fun callContact(name0: String): Boolean {
+        if (ctx.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) { say("Please allow contacts in Friday setup"); return false }
+        val cands = mutableListOf<Pair<String, String>>()
+        ctx.contentResolver.query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI, arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER), null, null, null)
+            ?.use { c -> while (c.moveToNext()) cands += (c.getString(0) ?: "") to (c.getString(1) ?: "") }
+        val key = norm(name0)
+        val rel = listOf(listOf("mummy", "mom", "maa", "mother", "mumma", "mama", "amma"), listOf("papa", "dad", "father", "pappa", "baba"))
+        val syn = rel.firstOrNull { key in it } ?: listOf(key)
+        val best = cands.firstOrNull { norm(it.first) == key } ?: cands.firstOrNull { c -> syn.any { norm(c.first).contains(it) } }
+            ?: cands.firstOrNull { key.length >= 3 && norm(it.first).contains(key) }
+            ?: cands.minByOrNull { lev(norm(it.first), key) }?.takeIf { lev(norm(it.first), key) <= maxOf(1, key.length / 3) }
+        if (best == null) { say("I could not find $name0 in your contacts"); return false }
+        say("Calling ${best.first}")
+        val act = if (ctx.checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) Intent.ACTION_CALL else Intent.ACTION_DIAL
+        return launch(Intent(act, Uri.parse("tel:" + Uri.encode(best.second))))
+    }
+
+    // ---------------- math ----------------
+    private fun math(t: String) {
+        Mathx.solve(t)?.let { return say(it) }
+        val e = Mathx.expr(t)
+        if (e != null) thread {
+            try {
+                val c = URL("https://api.mathjs.org/v4/?expr=" + enc(e)).openConnection() as HttpURLConnection; c.connectTimeout = 8000; c.readTimeout = 8000
+                say("The answer is " + c.inputStream.bufferedReader().readText().trim())
+            } catch (x: Exception) { ask(t) }
+        } else ask(t)
+    }
+
+    // ---------------- online: news, answers, optional AI ----------------
+    private fun news() { thread {
         try {
             val xml = URL("https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en").readText()
             newsTitles = Regex("<item>.*?<title>(.*?)</title>", RegexOption.DOT_MATCHES_ALL).findAll(xml).map { it.groupValues[1].replace("&amp;", "and").replace("&quot;", "") }.take(6).toList()
             say("Today's headlines. " + newsTitles.mapIndexed { i, s -> "${i + 1}. $s" }.joinToString(". "))
-        } catch (e: Exception) { say("I could not fetch the news") }
-    }
-    private fun ask(q: String) = thread {
+        } catch (e: Exception) { say("I could not fetch the news") } } }
+
+    private fun ask(q: String) { thread {
         try {
+            aiAnswer(q)?.let { return@thread say(it) }
             val e = enc(q.replace(Regex("^(how to|what is|who is|tell me about)\\s+"), ""))
             val ddg = JSONObject(URL("https://api.duckduckgo.com/?q=$e&format=json&no_html=1&skip_disambig=1").readText()).optString("AbstractText")
             if (ddg.isNotBlank()) return@thread say(ddg)
             val s = JSONObject(URL("https://en.wikipedia.org/api/rest_v1/page/summary/$e").readText()).optString("extract")
             say(if (s.isNotBlank()) s else "I did not find anything for that")
-        } catch (ex: Exception) { say("Sorry, I did not understand: $q") }
+        } catch (ex: Exception) { say("Sorry, I did not understand: $q") } } }
+
+    /** Optional: the user's own Claude API key. Only the command TEXT is sent – never screen content. */
+    private fun claude(system: String, user: String, max: Int): String? {
+        val key = prefs.aiKey; if (key.isBlank()) return null
+        return try {
+            val body = JSONObject().put("model", "claude-haiku-5-5").put("max_tokens", max).put("system", system)
+                .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", user)))
+            val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+            c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 10000; c.readTimeout = 15000
+            c.setRequestProperty("x-api-key", key); c.setRequestProperty("anthropic-version", "2023-06-01"); c.setRequestProperty("content-type", "application/json")
+            c.outputStream.use { it.write(body.toString().toByteArray()) }
+            JSONObject(c.inputStream.bufferedReader().readText()).getJSONArray("content").getJSONObject(0).getString("text")
+        } catch (e: Exception) { Bus.post("info", "AI help failed: ${e.javaClass.simpleName}"); null }
+    }
+    private fun aiAnswer(q: String) = claude("You are a voice assistant. Answer in at most 3 short spoken sentences, plain text, no markdown. The user may speak English, Hindi or Hinglish; answer in the same language.", q, 300)
+    private fun aiInterpret(text: String): List<String>? {
+        val r = claude("Convert a spoken phone command (English, Hindi or Hinglish, may contain speech-recognition mistakes) into JSON only: {\"cmds\":[...]}. " +
+            "Allowed cmds: open <app>, play <youtube query>, yt_search <query>, search <query>, torch on, torch off, photo front, photo back, call <contact name>, media toggle, media next, media prev, " +
+            "scroll down, scroll up, volume up, volume down, click <label>, type <text>, send, back, home, time, date, news, math <expression in words>, ask <question>. " +
+            "Use several cmds in order for multi-step requests. Output JSON only.", text, 300) ?: return null
+        return try { val a = JSONObject(r.substring(r.indexOf('{'), r.lastIndexOf('}') + 1)).getJSONArray("cmds"); (0 until a.length()).map { a.getString(it) }.filter { it.isNotBlank() } } catch (e: Exception) { null }
     }
 }
 
@@ -232,9 +426,51 @@ object Words {
     }
 }
 
-object Eval {
-    fun run(s: String): Double { var p = 0
-        fun num(): Double { val st = p; while (p < s.length && (s[p].isDigit() || s[p] == '.')) p++; return s.substring(st, p).toDouble() }
-        fun term(): Double { var v = num(); while (p < s.length && (s[p] == '*' || s[p] == '/')) { val o = s[p++]; val r = num(); v = if (o == '*') v * r else v / r }; return v }
-        var v = term(); while (p < s.length && (s[p] == '+' || s[p] == '-')) { val o = s[p++]; val r = term(); v = if (o == '+') v + r else v - r }; return v }
+/** Maths in spoken form: + - × ÷, into/times/by, powers, roots, percent, tables. */
+object Mathx {
+    private val hindi = mapOf("ek" to "1", "teen" to "3", "char" to "4", "chaar" to "4", "paanch" to "5", "panch" to "5", "chhe" to "6", "chheh" to "6", "saat" to "7", "aath" to "8", "nau" to "9", "das" to "10")
+    private fun prep(t0: String): String {
+        var t = t0.split(" ").joinToString(" ") { hindi[it] ?: it }
+        return Words.toDigits(t)
+    }
+    fun tableN(t0: String): Int? {
+        val t = prep(t0)
+        return (Regex("table of (\\d+)").find(t) ?: Regex("(\\d+)\\s*(?:ka\\s*)?table").find(t) ?: Regex("table (\\d+)").find(t))?.groupValues?.get(1)?.toIntOrNull()
+    }
+    fun expr(t0: String): String? {
+        var t = prep(t0)
+        repeat(3) { t = t.replace(Regex("^(?:what is|calculate|tell me|find|solve|how much is|the value of|value of|answer of|kitna hota hai|kitne hote hain|evaluate)\\s*"), "") }
+        val n = "(\\d+(?:\\.\\d+)?)"
+        t = t.replace(Regex("(?:square root|squareroot|under root|underroot|sqrt|root)\\s*(?:of\\s*)?$n"), "sqrt($1)")
+            .replace(Regex("$n\\s*(?:squared|square)"), "($1)^2").replace(Regex("$n\\s*(?:cubed|cube)"), "($1)^3")
+            .replace(Regex("$n\\s*(?:to the power of|to the power|raised to|power)\\s*$n"), "$1^$2")
+            .replace(Regex("$n\\s*(?:percent|percentage|%)\\s*of\\s*$n"), "($1/100)*$2")
+            .replace(Regex("\\b(?:multiplied by|multiply by|multiply|times|into|cross|guna|x)\\b"), "*")
+            .replace(Regex("\\b(?:divided by|divide by|upon|over|by|bhag|bhaag)\\b"), "/")
+            .replace(Regex("\\b(?:plus|add|jod)\\b"), "+").replace(Regex("\\b(?:minus|subtract|less|ghata|ghatao)\\b"), "-")
+            .replace(" ", "")
+        if (!Regex("^[0-9.+\\-*/^()sqrt]+$").matches(t)) return null
+        return if (Regex("[0-9)][+\\-*/^]|sqrt").containsMatchIn(t)) t else null
+    }
+    fun intent(t: String) = tableN(t) != null || expr(t) != null
+    fun solve(t: String): String? {
+        tableN(t)?.let { n -> return "Table of $n. " + (1..10).joinToString(". ") { "$n times $it is ${n * it}" } }
+        val e = expr(t) ?: return null
+        return try { "The answer is " + fmt(P(e).parse()) } catch (x: Exception) { null }
+    }
+    private fun fmt(d: Double): String = if (d % 1.0 == 0.0 && Math.abs(d) < 1e15) d.toLong().toString() else "%.6f".format(d).trimEnd('0').trimEnd('.')
+    private class P(val s: String) {
+        var i = 0
+        fun parse(): Double { val v = expr(); if (i != s.length) throw IllegalStateException(); return v }
+        fun expr(): Double { var v = term(); while (i < s.length && (s[i] == '+' || s[i] == '-')) { val o = s[i++]; val r = term(); v = if (o == '+') v + r else v - r }; return v }
+        fun term(): Double { var v = pow(); while (i < s.length && (s[i] == '*' || s[i] == '/')) { val o = s[i++]; val r = pow(); v = if (o == '*') v * r else v / r }; return v }
+        fun pow(): Double { val b = unary(); if (i < s.length && s[i] == '^') { i++; return Math.pow(b, pow()) }; return b }
+        fun unary(): Double { if (s[i] == '-') { i++; return -unary() }; if (s[i] == '+') { i++; return unary() }; return atom() }
+        fun atom(): Double {
+            if (s.startsWith("sqrt", i)) { i += 4; return Math.sqrt(atom()) }
+            if (s[i] == '(') { i++; val v = expr(); if (i >= s.length || s[i] != ')') throw IllegalStateException(); i++; return v }
+            val st = i; while (i < s.length && (s[i].isDigit() || s[i] == '.')) i++
+            return s.substring(st, i).toDouble()
+        }
+    }
 }

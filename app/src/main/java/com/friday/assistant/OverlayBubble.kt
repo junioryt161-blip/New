@@ -42,6 +42,7 @@ object OverlayBubble {
         }
         wm.addView(b, lp); box = b; logo = l; cap = t
     }
+    fun visible(v: Boolean) { h.post { box?.visibility = if (v) View.VISIBLE else View.GONE } }
     fun state(s: Int) { h.post { logo?.state = s } }
     fun caption(s: String) = h.post {
         cap?.apply { text = if (s.length > 70) s.take(70) + "…" else s; visibility = View.VISIBLE }

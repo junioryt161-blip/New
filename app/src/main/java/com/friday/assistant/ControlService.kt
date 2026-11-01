@@ -4,14 +4,30 @@ import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Bundle
+import android.os.Build
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
 /** The assistant's "hands": taps, types and scrolls inside any app, silently. */
+object Foreground { @Volatile var pkg: String? = null }
+/** Friday switches itself off while a payment / banking app is open. */
+object Privacy {
+    @Volatile var paused = false
+    private val keys = listOf("phonepe", "paytm", "paisa", "bhim", "upi", "bank", "mobikwik", "freecharge", "razorpay", "amazonpay", "cred.club")
+    fun isPayment(p: String) = keys.any { p.lowercase().contains(it) }
+}
+
 class ControlService : AccessibilityService() {
     companion object { var inst: ControlService? = null }
     override fun onServiceConnected() { inst = this }
-    override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+        if (e?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        val p = e.packageName?.toString() ?: return
+        if (p.contains("inputmethod") || p.contains("keyboard") || p == "com.android.systemui") return
+        Foreground.pkg = p
+        val was = Privacy.paused; Privacy.paused = Privacy.isPayment(p)
+        if (was != Privacy.paused) Bus.post("info", if (Privacy.paused) "Paused: payment app open" else "Resumed")
+    }
     override fun onInterrupt() {}
     override fun onDestroy() { inst = null; super.onDestroy() }
 
@@ -50,6 +66,16 @@ class ControlService : AccessibilityService() {
         return f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, cur + text) })
     }
     fun focusEditable(): Boolean { val f = nodes().firstOrNull { it.isEditable } ?: return false; return f.performAction(AccessibilityNodeInfo.ACTION_CLICK) || tapCenter(f) }
+    fun imeEnter(): Boolean {
+        if (Build.VERSION.SDK_INT < 30) return false
+        val f = nodes().firstOrNull { it.isEditable && it.isFocused } ?: nodes().firstOrNull { it.isEditable } ?: return false
+        return f.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+    }
+    fun swipeH(left: Boolean): Boolean {
+        val w = resources.displayMetrics.widthPixels; val h = resources.displayMetrics.heightPixels
+        val p = Path().apply { if (left) { moveTo(w * .8f, h / 2f); lineTo(w * .2f, h / 2f) } else { moveTo(w * .2f, h / 2f); lineTo(w * .8f, h / 2f) } }
+        return dispatchGesture(GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(p, 0, 250)).build(), null, null)
+    }
     fun back() = performGlobalAction(GLOBAL_ACTION_BACK)
     fun home() = performGlobalAction(GLOBAL_ACTION_HOME)
 }
